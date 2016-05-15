@@ -1,49 +1,54 @@
 from multiprocessing.pool import ThreadPool
 from threading import Lock
+from cloudshell.api.cloudshell_api import *
+from cloudshell.api.common_cloudshell_api import *
+from cloudshell.core.logger import qs_logger
+from environment_scripts.helpers.vm_details_helper import get_vm_custom_param
+#from environment_scripts.profiler.env_profiler import profileit
 
 from cloudshell.helpers.scripts import cloudshell_scripts_helpers as helpers
-from cloudshell.api.cloudshell_api import *
-from cloudshell.api.common_cloudshell_api import CloudShellAPIError
-from cloudshell.core.logger import qs_logger
-
-from environment_scripts.helpers.vm_details_helper import get_vm_custom_param
-from environment_scripts.profiler.env_profiler import profileit
+import cloudshell.helpers.scripts.cloudshell_dev_helpers as dev
+import os
 
 
 class EnvironmentSetup(object):
     NO_DRIVER_ERR = "129"
 
     def __init__(self):
-        self.reservation_id = helpers.get_reservation_context_details().id
-        self.logger = qs_logger.get_qs_logger(log_file_prefix="CloudShell Sandbox Setup",
-                                              log_group=self.reservation_id,
-                                              log_category='Setup')
 
-    @profileit(scriptName='Setup')
+        reservation_id = 'd81cdeb6-76b0-4e8c-a1a4-92daa26366e0'
+        dev.attach_to_cloudshell_as('admin', 'admin', 'Global', reservation_id, 'localhost', 8029)
+        context = os.environ['RESERVATIONCONTEXT']
+
+        self.reservation_id = helpers.get_reservation_context_details().id
+        # self.logger = qs_logger.get_qs_logger(name="CloudShell Sandbox Setup", reservation_id=self.reservation_id)
+        self.logger = qs_logger.get_qs_logger(log_file_prefix="CloudShell Sandbox Setup",
+                                               log_group = self.reservation_id,
+                                               log_category = 'Setup')
+
     def execute(self):
         api = helpers.get_api_session()
         resource_details_cache = {}
 
         api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
                                             message='Beginning reservation setup')
+        #Duplicate apps with quantity
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        self._locateaApplicationToDuplicate(api, reservation_details)
+
+        #Deploy Domain Controllers
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        deploy_result = self._deploy_DC_apps_(api=api, reservation_details=reservation_details)
+
+        #Set DC IP
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        self._set_DC_IP(api, reservation_details)
+
+        # refresh reservation after DC deployment, connet DC's to VLANs
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        self._connect_DC_routes(api=api, reservation_details=reservation_details)
 
         reservation_details = api.GetReservationDetails(self.reservation_id)
-
-        deploy_result = self._deploy_apps_in_reservation(api=api,
-                                                         reservation_details=reservation_details)
-
-        # refresh reservation_details after app deployment if any deployed apps
-        if deploy_result and deploy_result.ResultItems:
-            reservation_details = api.GetReservationDetails(self.reservation_id)
-
-        self._try_exeucte_autoload(api=api,
-                                   reservation_details=reservation_details,
-                                   deploy_result=deploy_result,
-                                   resource_details_cache=resource_details_cache)
-
-        self._connect_all_routes_in_reservation(api=api,
-                                                reservation_details=reservation_details)
-
         self._run_async_power_on_refresh_ip_install(api=api,
                                                     reservation_details=reservation_details,
                                                     deploy_results=deploy_result,
@@ -52,6 +57,67 @@ class EnvironmentSetup(object):
         self.logger.info("Setup for reservation {0} completed".format(self.reservation_id))
         api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
                                             message='Reservation setup finished successfully')
+
+
+    def _locateaApplicationToDuplicate(self,api, reservation_details):
+        for app in reservation_details.ReservationDescription.Apps:
+           if app.LogicalResource.Model == 'Work Station':
+               _appName = app.Name
+               for attribute in app.LogicalResource.Attributes:
+                   if attribute.Name == 'Quantity':
+                       _quantity = int (attribute.Value)
+
+                       if _quantity > 1:
+                           self._duplicateApp(api, _appName, _quantity )
+                           reservation_details = api.GetReservationDetails(self.reservation_id)
+                           self._duplicateVLANConnectors(api, _appName,reservation_details)
+                       break
+        return
+
+    def _duplicateApp(self, api, appname, quantity):
+
+        _positions = api.GetReservationServicesPositions(self.reservation_id)
+
+        for position in _positions.ResourceDiagramLayouts:
+            if position.ResourceName == appname:
+                _X = position.X
+                _Y = position.Y
+
+        for item in range(0, quantity - 1):
+            _X += 20
+            _Y += 20
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                                message='Add {0} instance to resevation'.format(appname))
+            api.AddAppToReservation(self.reservation_id, appname, _X, _Y)
+
+    def _duplicateVLANConnectors(self, api, appname, reservation_details):
+
+        _connectors = reservation_details.ReservationDescription.Connectors
+        for connector in _connectors:
+            if connector.Source == appname:
+                target = connector.Target
+            if connector.Target == appname:
+                target = connector.Source
+                break
+
+        connectors = []
+
+        for app in reservation_details.ReservationDescription.Apps:
+            if appname in app.Name and appname != app.Name:
+                connectorRequest = SetConnectorRequest(app.Name, target,'bi','')
+                connectors.append(connectorRequest)
+                api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                                    message='add visual connector between "{0}" and "{1}"'.format(app.Name, target))
+        api.SetConnectorsInReservation(self.reservation_id, connectors)
+
+    def _set_DC_IP(self, api, reservation_details):
+
+        ressources = reservation_details.ReservationDescription.Resources
+        DCs = filter(lambda x: x.ResourceModelName == 'DC', ressources)
+        #commands =  api.GetResourceCommands
+        for dc in DCs:
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message= 'Call to Set DC IP command, DC name: {0}'.format(dc.Name))
+            api.ExecuteResourceCommand(self.reservation_id,(dc.Name), 'SetVM_IP')
 
     def _try_exeucte_autoload(self, api, reservation_details, deploy_result, resource_details_cache):
         """
@@ -129,6 +195,29 @@ class EnvironmentSetup(object):
 
         return res
 
+    def _deploy_DC_apps_(self, api, reservation_details):
+
+        apps = reservation_details.ReservationDescription.Apps
+        DCs = filter(lambda x: x.LogicalResource.Model == 'DC', apps)
+
+        if not DCs or (len(DCs) == 0):
+            self.logger.info("No DCs found in reservation {0}".format(self.reservation_id))
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                                message='No DC app to deploy')
+            return None
+
+        app_names = map(lambda x: x.Name, DCs)
+        app_inputs = map(lambda x: DeployAppInput(x.Name, "Name", x.Name), DCs)
+
+        api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                            message='DC deployment started')
+        self.logger.info(
+            "Deploying DCs for reservation {0}. App names: {1}".format(reservation_details, ", ".join(app_names)))
+
+        res = api.DeployAppToCloudProviderBulk(self.reservation_id, app_names, app_inputs)
+
+        return res
+
     def _connect_all_routes_in_reservation(self, api, reservation_details):
         connectors = reservation_details.ReservationDescription.Connectors
         endpoints = []
@@ -137,6 +226,36 @@ class EnvironmentSetup(object):
                     and endpoint.Target and endpoint.Source:
                 endpoints.append(endpoint.Target)
                 endpoints.append(endpoint.Source)
+
+        if not endpoints:
+            self.logger.info("No routes to connect for reservation {0}".format(self.reservation_id))
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                                message='Nothing to connect')
+            return
+
+        self.logger.info("Executing connect routes for reservation {0}".format(self.reservation_id))
+        self.logger.debug("Connecting: {0}".format(",".join(endpoints)))
+        api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                            message='Connecting all apps')
+        res = api.ConnectRoutesInReservation(self.reservation_id, endpoints, 'bi')
+        return res
+
+    def _connect_DC_routes(self, api, reservation_details):
+        connectors = reservation_details.ReservationDescription.Connectors
+        endpoints = []
+        vlan = ''
+        for connector in connectors:
+            sourceModel = api.GetResourceDetails(self,connector.Source).ResourceModelName
+            targetModel = api.GetResourceDetails(self, connector.Target).ResourceModelName
+            if sourceModel == 'DC':
+                vlan = targetModel
+            if targetModel == 'DC':
+                vlan = sourceModel
+
+            if connector.State in ['Disconnected', 'PartiallyConnected', 'ConnectionFailed'] \
+                    and connector.Target and connector.Source:
+                endpoints.append(connector.Target)
+                endpoints.append(connector.Source)
 
         if not endpoints:
             self.logger.info("No routes to connect for reservation {0}".format(self.reservation_id))
