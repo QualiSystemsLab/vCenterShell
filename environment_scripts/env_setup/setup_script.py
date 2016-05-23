@@ -16,7 +16,7 @@ class EnvironmentSetup(object):
 
     def __init__(self):
 
-        reservation_id = 'd81cdeb6-76b0-4e8c-a1a4-92daa26366e0'
+        reservation_id = 'a62564fd-1d64-441b-b68a-efbecdddf70e'
         dev.attach_to_cloudshell_as('admin', 'admin', 'Global', reservation_id, 'localhost', 8029)
         context = os.environ['RESERVATIONCONTEXT']
 
@@ -48,11 +48,21 @@ class EnvironmentSetup(object):
         reservation_details = api.GetReservationDetails(self.reservation_id)
         self._connect_DC_routes(api=api, reservation_details=reservation_details)
 
+
+
         reservation_details = api.GetReservationDetails(self.reservation_id)
         self._run_async_power_on_refresh_ip_install(api=api,
                                                     reservation_details=reservation_details,
                                                     deploy_results=deploy_result,
                                                     resource_details_cache=resource_details_cache)
+
+
+
+
+
+
+
+
 
         self.logger.info("Setup for reservation {0} completed".format(self.reservation_id))
         api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
@@ -269,6 +279,47 @@ class EnvironmentSetup(object):
                                             message='Connecting all apps')
         res = api.ConnectRoutesInReservation(self.reservation_id, endpoints, 'bi')
         return res
+
+    def _DC_run_async_power_on_refresh_ip_validConfiguration(self, api, reservation_details, deploy_results, resource_details_cache):
+        """
+        :param CloudShellAPISession api:
+        :param GetReservationDescriptionResponseInfo reservation_details:
+        :param BulkAppDeploymentyInfo deploy_results:
+        :param (dict of str: ResourceInfo) resource_details_cache:
+        :return:
+        """
+        resources = reservation_details.ReservationDescription.Resources
+        if len(resources) == 0:
+            api.WriteMessageToReservationOutput(
+                reservationId=self.reservation_id,
+                message='No resources to power on or install')
+            self._validate_all_apps_deployed(deploy_results)
+            return
+
+        pool = ThreadPool(len(resources))
+        lock = Lock()
+        message_status = {
+            "power_on": False,
+            "wait_for_ip": False,
+            "install": False
+        }
+
+        async_results = [pool.apply_async(self._power_on_refresh_ip_install,
+                                          (api, lock, message_status, resource, deploy_results, resource_details_cache))
+                         for resource in resources]
+
+        pool.close()
+        pool.join()
+
+        for async_result in async_results:
+            res = async_result.get()
+            if not res[0]:
+                raise Exception("Reservation is Active with Errors - " + res[1])
+
+        self._validate_all_apps_deployed(deploy_results)
+
+
+    
 
     def _run_async_power_on_refresh_ip_install(self, api, reservation_details, deploy_results, resource_details_cache):
         """
