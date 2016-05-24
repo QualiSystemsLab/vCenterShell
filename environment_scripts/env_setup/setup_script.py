@@ -16,7 +16,7 @@ class EnvironmentSetup(object):
 
     def __init__(self):
 
-        reservation_id = 'a62564fd-1d64-441b-b68a-efbecdddf70e'
+        reservation_id = 'd81cdeb6-76b0-4e8c-a1a4-92daa26366e0'
         dev.attach_to_cloudshell_as('admin', 'admin', 'Global', reservation_id, 'localhost', 8029)
         context = os.environ['RESERVATIONCONTEXT']
 
@@ -127,7 +127,34 @@ class EnvironmentSetup(object):
         #commands =  api.GetResourceCommands
         for dc in DCs:
             api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message= 'Call to Set DC IP command, DC name: {0}'.format(dc.Name))
-            api.ExecuteResourceCommand(self.reservation_id,(dc.Name), 'SetVM_IP')
+            #api.ExecuteResourceCommand(self.reservation_id, dc.Name, 'SetVM_IP_And_ConfFile')
+            self._connect_DC_routes(dc.Name,api, reservation_details)
+
+    def _connect_DC_routes(self, dc_name,api, reservation_details):
+
+        DCs = filter(lambda x: x.ResourceModelName=='DC' ,reservation_details.ReservationDescription.Resources)
+        connectors = reservation_details.ReservationDescription.Connectors
+        vlan = ''
+
+        for dc in DCs:
+            for connector in connectors:
+                if connector.Source == dc.Name or connector.Target == dc.Name and dc_name == dc.Name and connector.State == 'Disconnected':
+                    if connector.Source == dc.Name:
+                        vlan = connector.Target
+                    if connector.Target == dc.Name:
+                        vlan = connector.Source
+
+                #Dc vlan found
+                self.logger.info("Executing connect DC: {1} routes for reservation {0}".format(self.reservation_id,dc_name))
+                api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("Executing connect_all vlan: {0} ".format(vlan)))
+                api.ExecuteCommand(self.reservation_id, vlan, '1', 'Vlan Service Connect All', [], False)
+                return
+
+        if not vlan:
+            self.logger.info("No VLANs connected to {0}, reservation id: ".format(dc_name,self.reservation_id))
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                                message='No DC to connect')
+            return
 
     def _try_exeucte_autoload(self, api, reservation_details, deploy_result, resource_details_cache):
         """
