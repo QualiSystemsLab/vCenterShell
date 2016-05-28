@@ -4,11 +4,11 @@ from cloudshell.api.cloudshell_api import *
 from cloudshell.api.common_cloudshell_api import *
 from cloudshell.core.logger import qs_logger
 from environment_scripts.helpers.vm_details_helper import get_vm_custom_param
-#from environment_scripts.profiler.env_profiler import profileit
 
 from cloudshell.helpers.scripts import cloudshell_scripts_helpers as helpers
 import cloudshell.helpers.scripts.cloudshell_dev_helpers as dev
 import os
+import time
 
 
 class EnvironmentSetup(object):
@@ -16,7 +16,7 @@ class EnvironmentSetup(object):
 
     def __init__(self):
 
-        reservation_id = 'd81cdeb6-76b0-4e8c-a1a4-92daa26366e0'
+        reservation_id = 'af4285ad-fafe-4797-80b8-e9bcf2dc9b7f'
         dev.attach_to_cloudshell_as('admin', 'admin', 'Global', reservation_id, 'localhost', 8029)
         context = os.environ['RESERVATIONCONTEXT']
 
@@ -32,32 +32,24 @@ class EnvironmentSetup(object):
 
         api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
                                             message='Beginning reservation setup')
-        #Duplicate apps with quantity
+        # Duplicate apps with quantity
         reservation_details = api.GetReservationDetails(self.reservation_id)
-        self._locateaApplicationToDuplicate(api, reservation_details)
+        #self._locateaApplicationToDuplicate(api, reservation_details)
 
-        #Deploy Domain Controllers
+        # Deploy Domain Controllers
         reservation_details = api.GetReservationDetails(self.reservation_id)
         deploy_result = self._deploy_DC_apps_(api=api, reservation_details=reservation_details)
 
         #Set DC IP
         reservation_details = api.GetReservationDetails(self.reservation_id)
-        self._set_DC_IP(api, reservation_details)
+        #self._set_DC_IP_and_connect_DC_routes(api, reservation_details)
 
-        # refresh reservation after DC deployment, connet DC's to VLANs
+        #power on
+        DC_TIMEOUT = time.time() + 60 * 3   # 5 minutes from now
         reservation_details = api.GetReservationDetails(self.reservation_id)
-        self._connect_DC_routes(api=api, reservation_details=reservation_details)
-
-
-
-        reservation_details = api.GetReservationDetails(self.reservation_id)
-        self._run_async_power_on_refresh_ip_install(api=api,
-                                                    reservation_details=reservation_details,
-                                                    deploy_results=deploy_result,
-                                                    resource_details_cache=resource_details_cache)
-
-
-
+        self._DC_run_async_power_on_refresh_ip_valid_configuration(api=api, reservation_details=reservation_details, deploy_results=deploy_result, resource_details_cache=resource_details_cache)
+        self._wait_for_all_DC_donfiguration_files_finish(api, reservation_details, DC_TIMEOUT)
+        self._run_DC_sanity_tests(api, reservation_details)
 
 
 
@@ -120,18 +112,23 @@ class EnvironmentSetup(object):
                                                     message='add visual connector between "{0}" and "{1}"'.format(app.Name, target))
         api.SetConnectorsInReservation(self.reservation_id, connectors)
 
-    def _set_DC_IP(self, api, reservation_details):
+    def _set_DC_IP_and_connect_DC_routes(self, api, reservation_details):
 
         ressources = reservation_details.ReservationDescription.Resources
         DCs = filter(lambda x: x.ResourceModelName == 'DC', ressources)
-        #commands =  api.GetResourceCommands
+
+        if len(DCs) == 0:
+            api.WriteMessageToReservationOutput(
+                reservationId=self.reservation_id,
+                message='No DC to: Set Up and connect routes')
+            return
+
         for dc in DCs:
             api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message= 'Call to Set DC IP command, DC name: {0}'.format(dc.Name))
-            #api.ExecuteResourceCommand(self.reservation_id, dc.Name, 'SetVM_IP_And_ConfFile')
-            self._connect_DC_routes(dc.Name,api, reservation_details)
+            api.ExecuteResourceCommand(self.reservation_id, dc.Name, 'Set_vm_ip_and_conf_file')
+            self._connect_dc_routes_command(dc.Name,api, reservation_details)
 
-    def _connect_DC_routes(self, dc_name,api, reservation_details):
-
+    def _connect_dc_routes_command(self, dc_name,api, reservation_details):
         DCs = filter(lambda x: x.ResourceModelName=='DC' ,reservation_details.ReservationDescription.Resources)
         connectors = reservation_details.ReservationDescription.Connectors
         vlan = ''
@@ -143,18 +140,17 @@ class EnvironmentSetup(object):
                         vlan = connector.Target
                     if connector.Target == dc.Name:
                         vlan = connector.Source
-
-                #Dc vlan found
-                self.logger.info("Executing connect DC: {1} routes for reservation {0}".format(self.reservation_id,dc_name))
-                api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("Executing connect_all vlan: {0} ".format(vlan)))
-                api.ExecuteCommand(self.reservation_id, vlan, '1', 'Vlan Service Connect All', [], False)
-                return
-
         if not vlan:
-            self.logger.info("No VLANs connected to {0}, reservation id: ".format(dc_name,self.reservation_id))
+            self.logger.info("No VLANs connected to {0}, reservation id: ".format(dc_name, self.reservation_id))
             api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                                message='No DC to connect')
+                                                message='No VLANs connected to {0}'.format(dc_name))
             return
+
+        #Dc vlan found
+        self.logger.info("Executing connect DC: {1} routes for reservation {0}".format(self.reservation_id, dc_name))
+        api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("Executing connect_all vlan: {0} ".format(vlan)))
+        api.ExecuteCommand(self.reservation_id, vlan, '1', 'Vlan Service Connect All', [], False)
+        return
 
     def _try_exeucte_autoload(self, api, reservation_details, deploy_result, resource_details_cache):
         """
@@ -277,37 +273,7 @@ class EnvironmentSetup(object):
         res = api.ConnectRoutesInReservation(self.reservation_id, endpoints, 'bi')
         return res
 
-    def _connect_DC_routes(self, api, reservation_details):
-        connectors = reservation_details.ReservationDescription.Connectors
-        endpoints = []
-        vlan = ''
-        for connector in connectors:
-            sourceModel = api.GetResourceDetails(self,connector.Source).ResourceModelName
-            targetModel = api.GetResourceDetails(self, connector.Target).ResourceModelName
-            if sourceModel == 'DC':
-                vlan = targetModel
-            if targetModel == 'DC':
-                vlan = sourceModel
-
-            if connector.State in ['Disconnected', 'PartiallyConnected', 'ConnectionFailed'] \
-                    and connector.Target and connector.Source:
-                endpoints.append(connector.Target)
-                endpoints.append(connector.Source)
-
-        if not endpoints:
-            self.logger.info("No routes to connect for reservation {0}".format(self.reservation_id))
-            api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                                message='Nothing to connect')
-            return
-
-        self.logger.info("Executing connect routes for reservation {0}".format(self.reservation_id))
-        self.logger.debug("Connecting: {0}".format(",".join(endpoints)))
-        api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                            message='Connecting all apps')
-        res = api.ConnectRoutesInReservation(self.reservation_id, endpoints, 'bi')
-        return res
-
-    def _DC_run_async_power_on_refresh_ip_validConfiguration(self, api, reservation_details, deploy_results, resource_details_cache):
+    def _DC_run_async_power_on_refresh_ip_valid_configuration(self, api, reservation_details, deploy_results, resource_details_cache):
         """
         :param CloudShellAPISession api:
         :param GetReservationDescriptionResponseInfo reservation_details:
@@ -315,15 +281,16 @@ class EnvironmentSetup(object):
         :param (dict of str: ResourceInfo) resource_details_cache:
         :return:
         """
-        resources = reservation_details.ReservationDescription.Resources
-        if len(resources) == 0:
+        DCs = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
+
+        if len(DCs) == 0:
             api.WriteMessageToReservationOutput(
                 reservationId=self.reservation_id,
-                message='No resources to power on or install')
+                message='No DC to power on or install')
             self._validate_all_apps_deployed(deploy_results)
             return
 
-        pool = ThreadPool(len(resources))
+        pool = ThreadPool(len(DCs))
         lock = Lock()
         message_status = {
             "power_on": False,
@@ -333,7 +300,7 @@ class EnvironmentSetup(object):
 
         async_results = [pool.apply_async(self._power_on_refresh_ip_install,
                                           (api, lock, message_status, resource, deploy_results, resource_details_cache))
-                         for resource in resources]
+                         for resource in DCs]
 
         pool.close()
         pool.join()
@@ -343,10 +310,49 @@ class EnvironmentSetup(object):
             if not res[0]:
                 raise Exception("Reservation is Active with Errors - " + res[1])
 
-        self._validate_all_apps_deployed(deploy_results)
+                # self._validate_all_apps_deployed(deploy_results)
 
+    def _wait_for_all_DC_donfiguration_files_finish(self, api, reservation_details, timeout):
 
-    
+        DCs = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
+
+        configuration_done = [0] * len(DCs)
+        condition = any(item != 1 for item in configuration_done)
+
+        while condition:
+
+            for index, dc in enumerate(DCs):
+                res = api.ExecuteCommand(self.reservation_id, dc.Name, '0', 'DC_customization_finished', [dc.FullAddress], False)
+
+                if res.Output == '1':
+                    configuration_done[index] = 1
+                    self.logger.debug("DC: {0} - finish customiztion file deployment".format(dc.Name))
+                    api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                                        message=("DC: {0} - finish customiztion file deployment".format(dc.Name)))
+
+                    condition = any(item != 1 for item in configuration_done)
+                    if not condition:
+                        break
+
+                if 0 in configuration_done and time.time() > timeout:
+                    y = next(i for i, v in enumerate(configuration_done) if v != 0)
+                    errored_dc = configuration_done[y]
+                    raise Exception("Timeout-DC: DC:{0} fail to spinup after timeput:{1} seconds.".format(errored_dc, timeout/60))
+        return
+
+    def _run_DC_sanity_tests(self, api, reservation_details):
+
+        DCs = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
+        for dc in enumerate(DCs):
+            res = api.ExecuteCommand(self.reservation_id, dc.Name, '0', 'DC_sanity_test',[dc.FullAddress], False)
+
+            if res.Output == '1':
+                self.logger.debug("DC: {0} - Sanity test passed".format(dc.Name))
+                api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("DC: {0} - Sanity test passed".format(dc.Name)))
+            else:
+                self.logger.debug("Error: DC: {0} - Sanity test fail".format(dc.Name))
+                api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("Error: DC: {0} - Sanity test passed".format(dc.Name)))
+                raise Exception("Error: DC: {0} - Sanity test fail".format(dc.Name))
 
     def _run_async_power_on_refresh_ip_install(self, api, reservation_details, deploy_results, resource_details_cache):
         """
