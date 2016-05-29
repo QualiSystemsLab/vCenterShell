@@ -16,7 +16,7 @@ class EnvironmentSetup(object):
 
     def __init__(self):
 
-        reservation_id = 'af4285ad-fafe-4797-80b8-e9bcf2dc9b7f'
+        reservation_id = 'd4020417-2951-4ea5-a851-ad67cceedcec'
         dev.attach_to_cloudshell_as('admin', 'admin', 'Global', reservation_id, 'localhost', 8029)
         context = os.environ['RESERVATIONCONTEXT']
 
@@ -34,7 +34,7 @@ class EnvironmentSetup(object):
                                             message='Beginning reservation setup')
         # Duplicate apps with quantity
         reservation_details = api.GetReservationDetails(self.reservation_id)
-        #self._locateaApplicationToDuplicate(api, reservation_details)
+        self._duplicate_non_dc_apps(api, reservation_details)
 
         # Deploy Domain Controllers
         reservation_details = api.GetReservationDetails(self.reservation_id)
@@ -42,14 +42,26 @@ class EnvironmentSetup(object):
 
         #Set DC IP
         reservation_details = api.GetReservationDetails(self.reservation_id)
-        #self._set_DC_IP_and_connect_DC_routes(api, reservation_details)
+        self._set_DC_IP_and_connect_DC_routes(api, reservation_details)
 
-        #power on
-        DC_TIMEOUT = time.time() + 60 * 3   # 5 minutes from now
+        #power on and run customization
+        DC_TIMEOUT = time.time() + 60 * 5   # 5 minutes from now
         reservation_details = api.GetReservationDetails(self.reservation_id)
         self._DC_run_async_power_on_refresh_ip_valid_configuration(api=api, reservation_details=reservation_details, deploy_results=deploy_result, resource_details_cache=resource_details_cache)
         self._wait_for_all_DC_donfiguration_files_finish(api, reservation_details, DC_TIMEOUT)
         self._run_DC_sanity_tests(api, reservation_details)
+        self.delete_temp_customization_files(api, reservation_details)
+
+        #Non DC
+        #Deploy
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        self._deploy_non_dc_apps(api=api, reservation_details=reservation_details)
+
+        #Set configuration file
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        self._set_non_dc_configuration_file_and_connect_routes(api=api, reservation_details=reservation_details)
+
+
 
 
 
@@ -61,22 +73,30 @@ class EnvironmentSetup(object):
                                             message='Reservation setup finished successfully')
 
 
-    def _locateaApplicationToDuplicate(self,api, reservation_details):
-        for app in reservation_details.ReservationDescription.Apps:
-           if app.LogicalResource.Model == 'Work Station':
-               _appName = app.Name
-               for attribute in app.LogicalResource.Attributes:
-                   if attribute.Name == 'Quantity':
-                       _quantity = int (attribute.Value)
 
-                       if _quantity > 1:
-                           self._duplicateApp(api, _appName, _quantity )
-                           reservation_details = api.GetReservationDetails(self.reservation_id)
-                           self._duplicateVLANConnectors(api, _appName,reservation_details)
-                       break
+
+    def _duplicate_non_dc_apps(self, api, reservation_details):
+
+        quantity = 0
+        self.configuration_dictionary = {}
+
+        for app in reservation_details.ReservationDescription.Apps:
+            if app.LogicalResource.Model != 'DC':
+                _appName = app.Name
+                for attribute in app.LogicalResource.Attributes:
+                    if attribute.Name == 'Quantity':
+                        quantity = int(attribute.Value)
+                    if attribute.Name == 'ConfigurationFileName':
+                        self.configuration_dictionary[_appName] = attribute.Value
+
+                if quantity > 1:
+                    self._duplicate_app(api, _appName, quantity)
+                    reservation_details = api.GetReservationDetails(self.reservation_id)
+                    self._duplicateVLANConnectors(api, _appName,reservation_details)
+                break
         return
 
-    def _duplicateApp(self, api, appname, quantity):
+    def _duplicate_app(self, api, appname, quantity):
 
         _positions = api.GetReservationServicesPositions(self.reservation_id)
 
@@ -125,7 +145,8 @@ class EnvironmentSetup(object):
 
         for dc in DCs:
             api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message= 'Call to Set DC IP command, DC name: {0}'.format(dc.Name))
-            api.ExecuteResourceCommand(self.reservation_id, dc.Name, 'Set_vm_ip_and_conf_file')
+            #api.ExecuteResourceCommand(self.reservation_id, dc.Name, 'Set_vm_ip_and_conf_file')
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='Connect routes - DC name :{0}'.format(dc.Name))
             self._connect_dc_routes_command(dc.Name,api, reservation_details)
 
     def _connect_dc_routes_command(self, dc_name,api, reservation_details):
@@ -151,6 +172,22 @@ class EnvironmentSetup(object):
         api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("Executing connect_all vlan: {0} ".format(vlan)))
         api.ExecuteCommand(self.reservation_id, vlan, '1', 'Vlan Service Connect All', [], False)
         return
+
+    def _set_non_dc_configuration_file_and_connect_routes(self, api, reservation_details):
+
+        allResources = reservation_details.ReservationDescription.Resources
+        resources = filter(lambda x: x.ResourceModelName == 'DC', allResources)
+
+        if len(resources) == 0:
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='No "non dc" apps to deploy')
+            return
+
+        for app in resources:
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='Call to "Set configuration file" command, DC name: {0}'.format(app.Name))
+            # api.ExecuteResourceCommand(self.reservation_id, dc.Name, 'Set_vm_ip_and_conf_file')
+
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='Connect routes - app name :{0}'.format(app.Name))
+            self._connect_dc_routes_command(app.Name, api, reservation_details)
 
     def _try_exeucte_autoload(self, api, reservation_details, deploy_result, resource_details_cache):
         """
@@ -251,6 +288,35 @@ class EnvironmentSetup(object):
 
         return res
 
+    def _deploy_non_dc_apps(self, api, reservation_details):
+
+        reservation_apps = reservation_details.ReservationDescription.Apps
+        apps = filter(lambda x: x.LogicalResource.Model != 'DC', reservation_apps)
+
+        if not apps or (len(apps) == 0):
+            self.logger.info("No 'Non DC' apps found in reservation {0}".format(self.reservation_id))
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                                message="No 'Non DC' apps found in reservation {0}".format(self.reservation_id))
+            return None
+
+        app_names = map(lambda x: x.Name, apps)
+        app_inputs = map(lambda x: DeployAppInput(x.Name, "Name", x.Name), apps)
+
+        api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='Start deploy non DC apps')
+        self.logger.info("Start deploy non DC apps")
+
+        res = api.DeployAppToCloudProviderBulk(self.reservation_id, app_names, app_inputs)
+
+        #set porperties to the created resources
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        non_dc_resources = filter(lambda x: x.ResourceModelName != 'DC', reservation_details.ReservationDescription.Resources)
+
+        for resource in non_dc_resources:
+            for app_key_name in self.configuration_dictionary.keys():
+                if app_key_name in resource:
+                    api.SetAttributeValue(resource,'ConfigurationFileName',self.configuration_dictionary[app_key_name])
+        return res
+
     def _connect_all_routes_in_reservation(self, api, reservation_details):
         connectors = reservation_details.ReservationDescription.Connectors
         endpoints = []
@@ -343,7 +409,7 @@ class EnvironmentSetup(object):
     def _run_DC_sanity_tests(self, api, reservation_details):
 
         DCs = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
-        for dc in enumerate(DCs):
+        for dc in DCs:
             res = api.ExecuteCommand(self.reservation_id, dc.Name, '0', 'DC_sanity_test',[dc.FullAddress], False)
 
             if res.Output == '1':
@@ -353,6 +419,14 @@ class EnvironmentSetup(object):
                 self.logger.debug("Error: DC: {0} - Sanity test fail".format(dc.Name))
                 api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("Error: DC: {0} - Sanity test passed".format(dc.Name)))
                 raise Exception("Error: DC: {0} - Sanity test fail".format(dc.Name))
+
+    def delete_temp_customization_files(self, api, reservation_details):
+
+        DCs = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
+        for dc in DCs:
+            api.ExecuteCommand(self.reservation_id, dc.Name, '0', 'Delete_customization_file', [dc.FullAddress], False)
+
+        return
 
     def _run_async_power_on_refresh_ip_install(self, api, reservation_details, deploy_results, resource_details_cache):
         """
