@@ -13,10 +13,13 @@ import time
 
 class EnvironmentSetup(object):
     NO_DRIVER_ERR = "129"
+    App_Name = 0
+    App_Template = 1
+    APP_Configuration_File = 2
 
     def __init__(self):
 
-        reservation_id = 'd4020417-2951-4ea5-a851-ad67cceedcec'
+        reservation_id = '1c7b4aa4-8397-4be8-be32-359f2bf3af69'
         dev.attach_to_cloudshell_as('admin', 'admin', 'Global', reservation_id, 'localhost', 8029)
         context = os.environ['RESERVATIONCONTEXT']
 
@@ -30,37 +33,28 @@ class EnvironmentSetup(object):
         api = helpers.get_api_session()
         resource_details_cache = {}
 
-        api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                            message='Beginning reservation setup')
-        # Duplicate apps with quantity
-        reservation_details = api.GetReservationDetails(self.reservation_id)
-        self._duplicate_non_dc_apps(api, reservation_details)
+        api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='Beginning reservation setup')
+        self._duplicate_non_dc_apps(api)
 
-        # Deploy Domain Controllers
-        reservation_details = api.GetReservationDetails(self.reservation_id)
-        deploy_result = self._deploy_DC_apps_(api=api, reservation_details=reservation_details)
-
-        #Set DC IP
-        reservation_details = api.GetReservationDetails(self.reservation_id)
-        self._set_DC_IP_and_connect_DC_routes(api, reservation_details)
-
-        #power on and run customization
-        DC_TIMEOUT = time.time() + 60 * 5   # 5 minutes from now
-        reservation_details = api.GetReservationDetails(self.reservation_id)
-        self._DC_run_async_power_on_refresh_ip_valid_configuration(api=api, reservation_details=reservation_details, deploy_results=deploy_result, resource_details_cache=resource_details_cache)
-        self._wait_for_all_DC_donfiguration_files_finish(api, reservation_details, DC_TIMEOUT)
-        self._run_DC_sanity_tests(api, reservation_details)
-        self.delete_temp_customization_files(api, reservation_details)
+        #DC
+        deploy_result = self._deploy_apps(api, True)
+        self._set_OSCustomizationSpec(api, True)
+        self._connect_connectors(api, True)
+        self._run_async_power_on_refresh_ip_valid_configuration(api, deploy_result, resource_details_cache, True)
+        DC_TIMEOUT = time.time() + 60 * 5  # 5 minutes from now
+        self._wait_for_all_configuration_files_finish(api, DC_TIMEOUT, True)
+        self._run_sanity_tests(api, True)
+        self.delete_temp_customization_files(api)
 
         #Non DC
-        #Deploy
-        reservation_details = api.GetReservationDetails(self.reservation_id)
-        self._deploy_non_dc_apps(api=api, reservation_details=reservation_details)
-
-        #Set configuration file
-        reservation_details = api.GetReservationDetails(self.reservation_id)
-        self._set_non_dc_configuration_file_and_connect_routes(api=api, reservation_details=reservation_details)
-
+        deploy_result = self._deploy_apps(api, False)
+        self._copy_configuration_file_to_all_non_DC_VMs(api)
+        self._set_OSCustomizationSpec(api, False)
+        self._connect_connectors(api, False)
+        self._run_async_power_on_refresh_ip_valid_configuration(api, deploy_result, resource_details_cache, False)
+        TIMEOUT = time.time() + 60 * 7  # 7 minutes from now
+        self._wait_for_all_configuration_files_finish(api, TIMEOUT, False)
+        self._run_sanity_tests(api, False)
 
 
 
@@ -75,28 +69,52 @@ class EnvironmentSetup(object):
 
 
 
-    def _duplicate_non_dc_apps(self, api, reservation_details):
+    def _duplicate_non_dc_apps(self, api):
+
+        reservation_details = api.GetReservationDetails(self.reservation_id)
 
         quantity = 0
-        self.configuration_dictionary = {}
+        self.apps_templates = []
+        non_dc_apps = filter(lambda x: x.LogicalResource.Model != 'DC', reservation_details.ReservationDescription.Apps)
+        current_app = [] * 3 # appname/ app Source / configuration file
 
-        for app in reservation_details.ReservationDescription.Apps:
-            if app.LogicalResource.Model != 'DC':
-                _appName = app.Name
-                for attribute in app.LogicalResource.Attributes:
-                    if attribute.Name == 'Quantity':
+        for app in non_dc_apps:
+            for attribute in app.LogicalResource.Attributes:
+
+                if attribute.Name == 'ConfigurationFileName' and attribute.Value:
+                    configutration_file = attribute.Value
+
+                if attribute.Name == 'Quantity':
+                    if self._represents_int(attribute.Value):
                         quantity = int(attribute.Value)
-                    if attribute.Name == 'ConfigurationFileName':
-                        self.configuration_dictionary[_appName] = attribute.Value
+                    else: raise ErrorParameter()
 
-                if quantity > 1:
-                    self._duplicate_app(api, _appName, quantity)
-                    reservation_details = api.GetReservationDetails(self.reservation_id)
-                    self._duplicateVLANConnectors(api, _appName,reservation_details)
-                break
-        return
+                if attribute.Name == 'App Template':
+                    app_template = attribute.Value
 
-    def _duplicate_app(self, api, appname, quantity):
+            if quantity == 1:
+                current_app = [app.Name,app.Name, configutration_file]
+                self.apps_templates.append(current_app)
+
+            if quantity > 1:
+                current_app = [app.Name, app_template, configutration_file] # insert the original app
+                self.apps_templates.append(current_app)
+
+                self._duplicate_app(api, app.Name, int(quantity),app_template, configutration_file)
+                reservation_details = api.GetReservationDetails(self.reservation_id)
+                self._duplicateVLANConnectors(api, app.Name, reservation_details)
+
+            if quantity == 0:
+                api.RemoveAppFromReservation(self.reservation_id, app.Name)
+
+    def _represents_int(self, s):
+        try:
+            int(s)
+            return True
+        except ValueError:
+            return False
+
+    def _duplicate_app(self, api, appname, quantity, app_template, configutration_file):
 
         _positions = api.GetReservationServicesPositions(self.reservation_id)
 
@@ -110,7 +128,9 @@ class EnvironmentSetup(object):
             _Y += 20
             api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
                                                 message='Add {0} instance to resevation'.format(appname))
-            api.AddAppToReservation(self.reservation_id, appname, _X, _Y)
+            duplicated_app = api.AddAppToReservation(self.reservation_id, app_template, _X, _Y)
+            current_app = [duplicated_app.ReservedAppName, appname, configutration_file]#insert app: new created app/app parent/configuration file
+            self.apps_templates.append(current_app)
 
     def _duplicateVLANConnectors(self, api, appname, reservation_details):
 
@@ -132,62 +152,88 @@ class EnvironmentSetup(object):
                                                     message='add visual connector between "{0}" and "{1}"'.format(app.Name, target))
         api.SetConnectorsInReservation(self.reservation_id, connectors)
 
-    def _set_DC_IP_and_connect_DC_routes(self, api, reservation_details):
+    def _set_OSCustomizationSpec(self, api, is_dc):
 
-        ressources = reservation_details.ReservationDescription.Resources
-        DCs = filter(lambda x: x.ResourceModelName == 'DC', ressources)
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        context = ''
 
-        if len(DCs) == 0:
-            api.WriteMessageToReservationOutput(
-                reservationId=self.reservation_id,
-                message='No DC to: Set Up and connect routes')
+        if is_dc:
+            resources = filter(lambda x: x.ResourceModelName == 'DC',
+                               reservation_details.ReservationDescription.Resources)
+            context = 'DC'
+        else:
+            resources = filter(lambda x: x.ResourceModelName != 'DC',
+                               reservation_details.ReservationDescription.Resources)
+            context = 'non DC'
+
+        if not resources:
             return
 
-        for dc in DCs:
-            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message= 'Call to Set DC IP command, DC name: {0}'.format(dc.Name))
-            #api.ExecuteResourceCommand(self.reservation_id, dc.Name, 'Set_vm_ip_and_conf_file')
-            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='Connect routes - DC name :{0}'.format(dc.Name))
-            self._connect_dc_routes_command(dc.Name,api, reservation_details)
+        if not resources:
+            api.WriteMessageToReservationOutput(
+                reservationId=self.reservation_id,
+                message='No {0} to Set Up OSCustomizationSpec file'.format(context))
+            return
 
-    def _connect_dc_routes_command(self, dc_name,api, reservation_details):
-        DCs = filter(lambda x: x.ResourceModelName=='DC' ,reservation_details.ReservationDescription.Resources)
+        for resource in resources:
+            try:
+                if is_dc:
+                    api.ExecuteCommand(self.reservation_id, resource.Name, '0', 'Set_vm_ip_and_OSCustomizationSpec', False)
+                else:
+                    api.ExecuteCommand(self.reservation_id, resource.Name, '0', 'Set_OSCustomizationSpec', False)
+
+            except Exception as exc:
+                self._internal_error(api, exc.args, exc.message)
+
+    def _connect_connectors(self, api, is_dc):
+
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        context = ''
+
+        if is_dc:
+            resources = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
+            context = 'DC'
+        else:
+            resources = filter(lambda x: x.ResourceModelName != 'DC', reservation_details.ReservationDescription.Resources)
+            context = 'non DC'
+
+        if not resources:
+            self.logger.info("No {0} to connect, reservation id: {1}: ".format(context, self.reservation_id))
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                                message='No {0} to connect'.format(context))
+            return
+
         connectors = reservation_details.ReservationDescription.Connectors
         vlan = ''
 
-        for dc in DCs:
+        for resource in resources:
             for connector in connectors:
-                if connector.Source == dc.Name or connector.Target == dc.Name and dc_name == dc.Name and connector.State == 'Disconnected':
-                    if connector.Source == dc.Name:
+                if connector.Source == resource.Name or connector.Target == resource.Name and connector.State != 'Conected':
+                    if connector.Source == resource.Name:
                         vlan = connector.Target
-                    if connector.Target == dc.Name:
+                    if connector.Target == resource.Name:
                         vlan = connector.Source
         if not vlan:
-            self.logger.info("No VLANs connected to {0}, reservation id: ".format(dc_name, self.reservation_id))
+            self.logger.info("No VLANs connected to {0}, reservation id: ".format(resource.Name, self.reservation_id))
             api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                                message='No VLANs connected to {0}'.format(dc_name))
+                                                message='No VLANs connected to {0}'.format(resource.Name))
             return
 
-        #Dc vlan found
-        self.logger.info("Executing connect DC: {1} routes for reservation {0}".format(self.reservation_id, dc_name))
+        self.logger.info("Executing connect VM: {1} routes for reservation {0}".format(self.reservation_id, resource.Name))
         api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("Executing connect_all vlan: {0} ".format(vlan)))
-        api.ExecuteCommand(self.reservation_id, vlan, '1', 'Vlan Service Connect All', [], False)
-        return
 
-    def _set_non_dc_configuration_file_and_connect_routes(self, api, reservation_details):
+        try:
+            api.ExecuteCommand(self.reservation_id, vlan, '1', 'Vlan Service Connect All', [], False)
+        except CloudShellAPIError as err:
+            self._internal_error(err.args, err.message)
 
-        allResources = reservation_details.ReservationDescription.Resources
-        resources = filter(lambda x: x.ResourceModelName == 'DC', allResources)
+    def _connect_non_dc_resources(self, api):
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        resources = reservation_details.ReservationDescription.Resources
+        resources = filter(lambda x: x.ResourceModelName != 'DC', resources)
 
-        if len(resources) == 0:
-            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='No "non dc" apps to deploy')
-            return
-
-        for app in resources:
-            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='Call to "Set configuration file" command, DC name: {0}'.format(app.Name))
-            # api.ExecuteResourceCommand(self.reservation_id, dc.Name, 'Set_vm_ip_and_conf_file')
-
-            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='Connect routes - app name :{0}'.format(app.Name))
-            self._connect_dc_routes_command(app.Name, api, reservation_details)
+        for resource in resources:
+            self._connect_connectors(resource.Name, api)
 
     def _try_exeucte_autoload(self, api, reservation_details, deploy_result, resource_details_cache):
         """
@@ -265,57 +311,52 @@ class EnvironmentSetup(object):
 
         return res
 
-    def _deploy_DC_apps_(self, api, reservation_details):
+    def _deploy_apps(self, api, is_dc):
 
-        apps = reservation_details.ReservationDescription.Apps
-        DCs = filter(lambda x: x.LogicalResource.Model == 'DC', apps)
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        all_apps = reservation_details.ReservationDescription.Apps
+        context = ''
 
-        if not DCs or (len(DCs) == 0):
-            self.logger.info("No DCs found in reservation {0}".format(self.reservation_id))
-            api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                                message='No DC app to deploy')
-            return None
+        if is_dc:
+            apps = filter(lambda x: x.LogicalResource.Model == 'DC', all_apps)
+            context = 'DC'
 
-        app_names = map(lambda x: x.Name, DCs)
-        app_inputs = map(lambda x: DeployAppInput(x.Name, "Name", x.Name), DCs)
-
-        api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                            message='DC deployment started')
-        self.logger.info(
-            "Deploying DCs for reservation {0}. App names: {1}".format(reservation_details, ", ".join(app_names)))
-
-        res = api.DeployAppToCloudProviderBulk(self.reservation_id, app_names, app_inputs)
-
-        return res
-
-    def _deploy_non_dc_apps(self, api, reservation_details):
-
-        reservation_apps = reservation_details.ReservationDescription.Apps
-        apps = filter(lambda x: x.LogicalResource.Model != 'DC', reservation_apps)
+        else:
+            apps = filter(lambda x: x.LogicalResource.Model != 'DC', all_apps)
+            context = 'Non DC'
 
         if not apps or (len(apps) == 0):
-            self.logger.info("No 'Non DC' apps found in reservation {0}".format(self.reservation_id))
+            self.logger.info("No '{1}' apps found in reservation {0}".format(self.reservation_id, context))
             api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                                message="No 'Non DC' apps found in reservation {0}".format(self.reservation_id))
+                                                message="No '{1}' apps found in reservation {0}".format(self.reservation_id, context))
             return None
 
         app_names = map(lambda x: x.Name, apps)
         app_inputs = map(lambda x: DeployAppInput(x.Name, "Name", x.Name), apps)
 
-        api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='Start deploy non DC apps')
-        self.logger.info("Start deploy non DC apps")
+        api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message="Start deploy {0} apps".format(context))
+        self.logger.info("Start deploy {0} apps".format(context))
 
         res = api.DeployAppToCloudProviderBulk(self.reservation_id, app_names, app_inputs)
 
-        #set porperties to the created resources
+        for item in res.ResultItems:
+            if not item.Success:
+                self._internal_error('Fail to deploy VM', item.AppName)
+
+        return res
+
+    def _copy_configuration_file_to_all_non_DC_VMs(self, api):
+
         reservation_details = api.GetReservationDetails(self.reservation_id)
         non_dc_resources = filter(lambda x: x.ResourceModelName != 'DC', reservation_details.ReservationDescription.Resources)
 
         for resource in non_dc_resources:
-            for app_key_name in self.configuration_dictionary.keys():
-                if app_key_name in resource:
-                    api.SetAttributeValue(resource,'ConfigurationFileName',self.configuration_dictionary[app_key_name])
-        return res
+            for app in self.apps_templates:
+                    underscore_position = int(resource.Name.rfind('_'))
+                    origin_app_name = resource.Name[0:underscore_position]
+
+                    if app[self.App_Name] == origin_app_name:
+                        api.SetAttributeValue(resource.Name, 'ConfigurationFileName', app[self.APP_Configuration_File])
 
     def _connect_all_routes_in_reservation(self, api, reservation_details):
         connectors = reservation_details.ReservationDescription.Connectors
@@ -339,24 +380,27 @@ class EnvironmentSetup(object):
         res = api.ConnectRoutesInReservation(self.reservation_id, endpoints, 'bi')
         return res
 
-    def _DC_run_async_power_on_refresh_ip_valid_configuration(self, api, reservation_details, deploy_results, resource_details_cache):
-        """
-        :param CloudShellAPISession api:
-        :param GetReservationDescriptionResponseInfo reservation_details:
-        :param BulkAppDeploymentyInfo deploy_results:
-        :param (dict of str: ResourceInfo) resource_details_cache:
-        :return:
-        """
-        DCs = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
+    def _run_async_power_on_refresh_ip_valid_configuration(self, api, deploy_results, resource_details_cache, is_dc):
 
-        if len(DCs) == 0:
-            api.WriteMessageToReservationOutput(
-                reservationId=self.reservation_id,
-                message='No DC to power on or install')
-            self._validate_all_apps_deployed(deploy_results)
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        context = ''
+
+        if is_dc:
+            resources = filter(lambda x: x.ResourceModelName == 'DC',
+                               reservation_details.ReservationDescription.Resources)
+            context = 'DC'
+        else:
+            resources = filter(lambda x: x.ResourceModelName != 'DC',
+                               reservation_details.ReservationDescription.Resources)
+            context = 'non DC'
+
+        if not resources:
+            self.logger.info("No {0} to power on, reservation id: {1}: ".format(context, self.reservation_id))
+            api.WriteMessageToReservationOutput( reservationId=self.reservation_id,message='No {0} to power on or install'.format(context))
+            #self._validate_all_apps_deployed(deploy_results)
             return
 
-        pool = ThreadPool(len(DCs))
+        pool = ThreadPool(len(resources))
         lock = Lock()
         message_status = {
             "power_on": False,
@@ -366,7 +410,7 @@ class EnvironmentSetup(object):
 
         async_results = [pool.apply_async(self._power_on_refresh_ip_install,
                                           (api, lock, message_status, resource, deploy_results, resource_details_cache))
-                         for resource in DCs]
+                         for resource in resources]
 
         pool.close()
         pool.join()
@@ -378,16 +422,16 @@ class EnvironmentSetup(object):
 
                 # self._validate_all_apps_deployed(deploy_results)
 
-    def _wait_for_all_DC_donfiguration_files_finish(self, api, reservation_details, timeout):
+    def _run_non_dc_sanity_tests(self, api, reservation_details, timeout):
 
-        DCs = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
+        resources = filter(lambda x: x.ResourceModelName != 'DC', reservation_details.ReservationDescription.Resources)
 
-        configuration_done = [0] * len(DCs)
+        configuration_done = [0] * len(resources)
         condition = any(item != 1 for item in configuration_done)
 
         while condition:
 
-            for index, dc in enumerate(DCs):
+            for index, dc in enumerate(resources):
                 res = api.ExecuteCommand(self.reservation_id, dc.Name, '0', 'DC_customization_finished', [dc.FullAddress], False)
 
                 if res.Output == '1':
@@ -406,27 +450,97 @@ class EnvironmentSetup(object):
                     raise Exception("Timeout-DC: DC:{0} fail to spinup after timeput:{1} seconds.".format(errored_dc, timeout/60))
         return
 
-    def _run_DC_sanity_tests(self, api, reservation_details):
+    def _wait_for_all_configuration_files_finish(self, api, timeout, is_dc):
 
-        DCs = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
-        for dc in DCs:
-            res = api.ExecuteCommand(self.reservation_id, dc.Name, '0', 'DC_sanity_test',[dc.FullAddress], False)
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        context = ''
+
+        if is_dc:
+            resources = filter(lambda x: x.ResourceModelName == 'DC',
+                               reservation_details.ReservationDescription.Resources)
+            context = 'DC'
+        else:
+            resources = filter(lambda x: x.ResourceModelName != 'DC',
+                               reservation_details.ReservationDescription.Resources)
+            context = 'non DC'
+
+        if not resources:
+            return
+
+        configuration_done = [0] * len(resources)
+        condition = any(item != 1 for item in configuration_done)
+
+        while condition:
+
+            for index, dc in enumerate(resources):
+                res = api.ExecuteCommand(self.reservation_id, dc.Name, '0', 'Customization_finished',
+                                         [dc.FullAddress], False)
+
+                if res.Output == '1':
+                    configuration_done[index] = 1
+                    self.logger.debug("DC: {0} - finish customiztion file deployment".format(dc.Name))
+                    api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                                        message=("DC: {0} - finish customiztion file deployment".format(
+                                                            dc.Name)))
+
+                    condition = any(item != 1 for item in configuration_done)
+                    if not condition:
+                        break
+
+                if 0 in configuration_done and time.time() > timeout:
+                    y = next(i for i, v in enumerate(configuration_done) if v != 0)
+                    errored_dc = configuration_done[y]
+                    raise Exception(
+                        "Timeout-DC: DC:{0} fail to spinup after timeput:{1} seconds.".format(errored_dc, timeout / 60))
+        return
+
+    def _run_sanity_tests(self, api, is_dc):
+
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        context = ''
+
+        if is_dc:
+            resources = filter(lambda x: x.ResourceModelName == 'DC',
+                               reservation_details.ReservationDescription.Resources)
+            context = 'DC'
+        else:
+            resources = filter(lambda x: x.ResourceModelName != 'DC',
+                               reservation_details.ReservationDescription.Resources)
+            context = 'non DC'
+
+        if not resources:
+            return
+
+        for resource in resources:
+            try:
+                if resource.ResourceModelName == 'DC':
+                    res = api.ExecuteCommand(self.reservation_id, resource.Name, '0', 'DC_sanity_test',
+                                             [resource.FullAddress], False)
+                if resource.ResourceModelName == 'WS':
+                    res = api.ExecuteCommand(self.reservation_id, resource.Name, '0', 'WS_sanity_test',
+                                             [resource.FullAddress], False)
+
+            except Exception as exc:
+                self._internal_error(api, exc.args, exc.message)
 
             if res.Output == '1':
-                self.logger.debug("DC: {0} - Sanity test passed".format(dc.Name))
-                api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("DC: {0} - Sanity test passed".format(dc.Name)))
+                self.logger.debug("VM: {0} - Sanity test passed".format(resource.Name))
+                api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("VM: {0} - Sanity test passed".format(resource.Name)))
             else:
-                self.logger.debug("Error: DC: {0} - Sanity test fail".format(dc.Name))
-                api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("Error: DC: {0} - Sanity test passed".format(dc.Name)))
-                raise Exception("Error: DC: {0} - Sanity test fail".format(dc.Name))
+                self.logger.debug("Error: VM: {0} - Sanity test fail".format(resource.Name))
+                api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=("Error: VM: {0} - Sanity test passed".format(resource.Name)))
 
-    def delete_temp_customization_files(self, api, reservation_details):
+    def delete_temp_customization_files(self, api):
+
+        reservation_details = api.GetReservationDetails(self.reservation_id)
 
         DCs = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
-        for dc in DCs:
-            api.ExecuteCommand(self.reservation_id, dc.Name, '0', 'Delete_customization_file', [dc.FullAddress], False)
 
-        return
+        for dc in DCs:
+            try:
+                api.ExecuteCommand(self.reservation_id, dc.Name, '0', 'Delete_OSCustomizationSpec', [dc.FullAddress], False)
+            except Exception as exc:
+                self._internal_error(api, exc.args, exc.message)
 
     def _run_async_power_on_refresh_ip_install(self, api, reservation_details, deploy_results, resource_details_cache):
         """
@@ -611,3 +725,7 @@ class EnvironmentSetup(object):
         else:
             self.logger.info("Auto Power On is off for deployed app {0} in reservation {1}"
                              .format(deployed_app_name, self.reservation_id))
+
+    def _internal_error(self, api, str_args, message):
+        api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                            message=("ERROR: {0} \n {1}".format(message,str_args)))
