@@ -2,27 +2,26 @@ from multiprocessing.pool import ThreadPool
 from threading import Lock
 from cloudshell.api.cloudshell_api import *
 from cloudshell.api.common_cloudshell_api import *
-from cloudshell.core.logger import qs_logger, interprocess_logger
+from cloudshell.core.logger import qs_logger
 from environment_scripts.helpers.vm_details_helper import get_vm_custom_param
 from utility import ProcessRunner
 import regex as re
-
 from cloudshell.helpers.scripts import cloudshell_scripts_helpers as helpers
-import cloudshell.helpers.scripts.cloudshell_dev_helpers as dev
-import os
 import time
+import cloudshell.helpers.scripts.cloudshell_dev_helpers as dev_helpers
 
 
 class EnvironmentSetup(object):
-    DC_TIMEOUT = time.time() + 60 * 0.3  # 15 minutes from now
-    NON_DC_TIMEOUT = time.time() + 60 * 7  # 7 minutes from now
-
+    DC_TIMEOUT = 0
+    NON_DC_TIMEOUT = 0
+    DC_DEPLOYED = True
     NO_DRIVER_ERR = "129"
     App_Name = 0
     APP_Parent = 1
     App_Template = 2
     APP_Configuration_File = 3
     Configuration_Done = 'EndCustomization'
+    CustomizationFilePath = 'c:\\EMC\SetupConfig.txt'
     Stop_Deployment_code = '201'
     Throw_Error_And_Continue_Code = '202'
 
@@ -38,12 +37,12 @@ class EnvironmentSetup(object):
 
     def __init__(self):
 
-        #reservation_id = '6c470fd0-723e-4b46-aff2-b0a8c1f07ab6'
-        #dev.attach_to_cloudshell_as('admin', 'admin', 'Global', reservation_id, 'localhost', 8029)
-        context = os.environ['RESERVATIONCONTEXT']
+        #self.reservation_id = helpers.get_reservation_context_details().id
 
-        self.reservation_id = helpers.get_reservation_context_details().id
-        self.logger = qs_logger.get_qs_logger(name="CloudShell Sandbox Setup", reservation_id=self.reservation_id)
+        # Debug
+        self.reservation_id = 'e97709c7-8051-4de7-b71e-c2ac4059ee3f'
+        dev_helpers.attach_to_cloudshell_as('admin', 'admin', 'Global', self.reservation_id, 'localhost', 8029)
+
         self.logger = qs_logger.get_qs_logger(log_file_prefix="CloudShell Sandbox Setup",
                                               log_group=self.reservation_id,
                                               log_category='Setup')
@@ -53,10 +52,16 @@ class EnvironmentSetup(object):
         resource_details_cache = {}
 
         api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='Beginning Sandbox setup\n')
+        api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='reservation ID: {0}\n'.format(
+            self.reservation_id))
+
+        self._read_config_keys()
         self._duplicate_non_dc_apps(api)
 
         # DC
+        self._is_legal_dc(api)
         deploy_result = self._deploy_apps(api, True)
+        self._rename_dc(api)
         self._set_os_customization_spec(api, True)
         self._connect_connectors(api, True)
         self._run_async_power_on_refresh_ip_valid_configuration(api, deploy_result, resource_details_cache, True)
@@ -76,6 +81,15 @@ class EnvironmentSetup(object):
         self.logger.info("Setup for reservation {0} completed".format(self.reservation_id))
         api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
                                             message='Reservation setup finished successfully')
+
+    def _read_config_keys(self):
+        with open(self.CustomizationFilePath) as myfile:
+            for line in myfile:
+                key, value = line.partition("=")[::2]
+                if key == 'DCTimeout':
+                    self.DC_TIMEOUT = int(value) * time.time() + 60
+                if key == 'NonDCTimeout':
+                    self.NON_DC_TIMEOUT = int(value) * time.time() + 60
 
     @staticmethod
     def _represents_int(s):
@@ -220,6 +234,34 @@ class EnvironmentSetup(object):
                 api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
                                                     message='add visual connector between "{0}" and "{1}"'.format(app_instance[self.App_Name], target))
 
+    def _rename_dc(self, api):
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+
+        resources = filter(lambda x: x.ResourceModelName == 'DC',
+                               reservation_details.ReservationDescription.Resources)
+
+        resources = self._get_resource_base_state(api, resources, self.Deployed)  # only deployed resources
+
+        for dc in resources:
+            current_resource_name = dc.Name
+            underscore_position = int(current_resource_name.rfind('_'))
+            origin_app_name = current_resource_name[0:underscore_position]
+
+            domain_name = api.GetAttributeValue(current_resource_name, 'Domain Name').Value
+
+            new_name = origin_app_name +'-' + domain_name
+            new_name_input = InputNameValue('new_dc_name', new_name)
+
+            inputs = []
+            inputs.append(new_name_input)
+
+            try:
+                api.ExecuteCommand(self.reservation_id, current_resource_name, '0', 'Rename_VM', inputs, False)
+            except Exception as exc:
+                self._internal_error(api, '20130', exc.message, str_args=exc.args)
+
+            api.RenameResource(current_resource_name, new_name)
+
     def _set_os_customization_spec(self, api, is_dc):
 
         reservation_details = api.GetReservationDetails(self.reservation_id)
@@ -316,62 +358,6 @@ class EnvironmentSetup(object):
         for resource in resources:
             self._connect_connectors(resource.Name, api)
 
-    def _try_exeucte_autoload(self, api, reservation_details, deploy_result, resource_details_cache):
-        """
-        :param GetReservationDescriptionResponseInfo reservation_details:
-        :param CloudShellAPISession api:
-        :param BulkAppDeploymentyInfo deploy_result:
-        :param (dict of str: ResourceInfo) resource_details_cache:
-        :return:
-        """
-
-        if deploy_result is None:
-            self.logger.info("No apps to discover")
-            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='No apps to discover')
-            return
-
-        message_written = False
-
-        for deployed_app in deploy_result.ResultItems:
-            if not deployed_app.Success:
-                continue
-            deployed_app_name = deployed_app.AppDeploymentyInfo.LogicalResourceName
-
-            resource_details = api.GetResourceDetails(deployed_app_name)
-            resource_details_cache[deployed_app_name] = resource_details
-
-            autoload = "true"
-            autoload_param = get_vm_custom_param(resource_details.VmDetails.VmCustomParams, "autoload")
-            if autoload_param:
-                autoload = autoload_param.Value
-            if autoload.lower() != "true":
-                self.logger.info("Apps discovery is disabled on deployed app {0}".format(deployed_app_name))
-                continue
-
-            try:
-                self.logger.info("Executing Autoload command on deployed app {0}".format(deployed_app_name))
-                if not message_written:
-                    api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                                        message='Apps are being discovered...')
-                    message_written = True
-
-                api.AutoLoad(deployed_app_name)
-
-            except CloudShellAPIError as exc:
-                if exc.code != EnvironmentSetup.NO_DRIVER_ERR:
-                    self.logger.error(
-                        "Error executing Autoload command on deployed app {0}. Error: {1}".format(deployed_app_name,
-                                                                                                  exc.rawxml))
-                    api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                                        message='Discovery failed on "{0}": {1}'
-                                                        .format(deployed_app_name, exc.message))
-            except Exception as exc:
-                self.logger.error("Error executing Autoload command on deployed app {0}. Error: {1}"
-                                  .format(deployed_app_name, str(exc)))
-                api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                                    message='Discovery failed on "{0}": {1}'
-                                                    .format(deployed_app_name, exc.message))
-
     def _deploy_apps_in_reservation(self, api, reservation_details):
         apps = reservation_details.ReservationDescription.Apps
         if not apps or (len(apps) == 1 and not apps[0].Name):
@@ -392,6 +378,31 @@ class EnvironmentSetup(object):
 
         return res
 
+    def _is_legal_dc(self, api):
+
+        reservation_details = api.GetReservationDetails(self.reservation_id)
+        all_apps = reservation_details.ReservationDescription.Apps
+
+        apps = filter(lambda x: x.LogicalResource.Model == 'DC', all_apps)
+
+        if not apps or (len(apps) == 0):  # no dc
+            return
+        for dc in apps:
+            for attribute in dc.LogicalResource.Attributes:
+                if attribute.Name == 'IP':
+                    is_ip = self.is_ipv4(attribute.Value)
+
+                    if not is_ip:
+                        massage = "app: '{0}' has in valid ip address".format(dc.Name)
+                        api.WriteMessageToReservationOutput(self.reservation_id, message=massage)
+                        self._internal_error(api, "20140", message=massage,str_args=None)
+
+                if attribute.Name == 'Domain Name':
+                    if not attribute.Value:
+                        massage = "app: '{0}': domain name cant be empty".format(dc.Name)
+                        api.WriteMessageToReservationOutput(self.reservation_id, message=massage)
+                        self._internal_error(api, "20140", message=massage, str_args=None)
+
     def _deploy_apps(self, api, is_dc):
 
         reservation_details = api.GetReservationDetails(self.reservation_id)
@@ -405,15 +416,14 @@ class EnvironmentSetup(object):
             apps = filter(lambda x: x.LogicalResource.Model != 'DC', all_apps)
             context = 'Non DC'
 
-        if not apps or (len(apps) == 0):
+        if not apps or (len(apps) == 0):  # no apps to deploy
             self.logger.info("No '{1}' apps found in reservation {0}".format(self.reservation_id, context))
             api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
                                                 message="No '{1}' apps found in reservation {0}".format(
                                                     self.reservation_id, context))
             if is_dc:
-                self._internal_error(api, '20130', "No 'DC' apps found in Sandbox")
-            else:
-                self._internal_error(api, '20132', "No 'Non DC' apps found in Sandbox")
+                self.DC_DEPLOYED = False
+            return
 
         app_names = map(lambda x: x.Name, apps)
         app_inputs = map(lambda x: DeployAppInput(x.Name, "Name", x.Name), apps)
@@ -594,18 +604,16 @@ class EnvironmentSetup(object):
         #  Get the user input IPs
         if is_dc:
             for resource in resources:
-                dc_input_ips.append(api.GetAttributeValue(resource.Name,'IP').Value)
+                dc_input_ips.append(api.GetAttributeValue(resource.Name, 'IP').Value)
 
         configuration_done = [0] * len(resources)
         not_all_vms_finish_customization = any(item == 0 for item in configuration_done)
 
         while not_all_vms_finish_customization:
             for index, vm in enumerate(resources):
-                api.ExecuteResourceConnectedCommand(self.reservation_id, vm.Name,
-                                                    "remote_refresh_ip",
-                                                    "remote_connectivity")  # refresh ip in cs from the resource
+                api.ExecuteResourceConnectedCommand(self.reservation_id, vm.Name,"remote_refresh_ip", "remote_connectivity")  # refresh ip in cs from the resource
 
-                current_vm_ip = vm.FullAddress
+                current_vm_ip = api.GetResourceDetails(vm.Name).Address
                 if is_dc:
                     if current_vm_ip not in dc_input_ips:
                         time.sleep(5)
@@ -615,36 +623,36 @@ class EnvironmentSetup(object):
                         time.sleep(5)
                         break  # end of  for index, vm in enumerate(resources) loop
 
+                ping_res = process_runner.execute('ping {0}'.format(current_vm_ip), False)
+                if 'Destination host unreachable' in ping_res[0] or 'Request timed out' in ping_res[0]:
+                    break
+
                 command = 'cmdkey /add:__IP__ /user:__USER__ /pass:__PASSWORD__'
 
-                ip = resources[index].FullAddress
                 user = 'administrator'
                 password = 'Welcome1!'
                 command = command.replace('__USER__', user)
                 command = command.replace('__PASSWORD__', password)
+                command = command.replace('__IP__', current_vm_ip)
 
-                res = process_runner.execute(command, None)  # set command credentials
-                if 'Credential added successfully' not in res[0]:
-                    api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                                        message=("CloudShell Execution server fail access VM: '{0}'".
-                                                                 format(ip)))
-                    self._internal_error(api,'20137', "CloudShell Execution server fail access VM: '{0}'".format(ip))
+                process_runner.execute(command, None)  # set command credentials
 
                 if configuration_done[index] == 0:
-                    cmd_dir = 'dir \\\\{0}\\c$ /A:D'.format(ip)
+                    cmd_dir = 'dir \\\\{0}\\c$ /A:D'.format(current_vm_ip)
 
-                    result = []
+                    result = [None] * 2
+
                     try:
                         result = process_runner.execute(cmd_dir, None)
                     except:
                         None
 
-                    if self.Configuration_Done in result[0]:
-                        configuration_done[index] = 1
-                        self.logger.debug("VM: {0} - finish customiztion file deployment".format(vm.Name))
-                        api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                                            message=("VM: {0} - finish customiztion file deploymen"
-                                                                     "t".format(vm.Name)))
+                    if result[0] is not None:
+                        if self.Configuration_Done in result[0]:
+                            configuration_done[index] = 1
+                            self.logger.debug("VM: {0} - finish customiztion file deployment".format(vm.Name))
+                            api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
+                                                                message=("VM: {0} - finish customiztion file deployment".format(vm.Name)))
 
             if 0 in configuration_done and time.time() > timeout:
 
@@ -666,13 +674,14 @@ class EnvironmentSetup(object):
                         errored_vm, errored_vm_address))
                     key = '20233'
 
-                api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message= message)
+                api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message=message)
                 self._internal_error(api, key, message)
                 return  # for non dc only
 
             not_all_vms_finish_customization = any(item == 0 for item in configuration_done)
 
             time.sleep(30)
+            api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='Waiting for customization to finish.')
 
         # out of While
         if is_dc:
@@ -681,9 +690,8 @@ class EnvironmentSetup(object):
         else:
             api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
                                                 message='All not DC VMs finished deployment')
-
         #  set resources state
-        self._set_resource_base_state(api, resources, self.Configuration_Done)
+        self._set_resource_base_state(api, resources, self.Customized)
 
     def _run_sanity_tests(self, api, is_dc):
 
@@ -721,7 +729,7 @@ class EnvironmentSetup(object):
             else:
                 if is_dc:
                     res2 = "DC: {0} sanity test end with failure".format(resource.Name)
-                    key = '20236'
+                    key = '20139'
                 else:
                     res2 = "non DC: {0} sanity test end with failure".format(resource.Name)
                     key = '20237'
@@ -734,15 +742,18 @@ class EnvironmentSetup(object):
 
     def delete_temp_customization_files(self, api):
 
+        if not self.DC_DEPLOYED:
+            return
+
         reservation_details = api.GetReservationDetails(self.reservation_id)
 
-        DCs = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
+        dcs = filter(lambda x: x.ResourceModelName == 'DC', reservation_details.ReservationDescription.Resources)
 
-        for dc in DCs:
+        for dc in dcs:
             try:
-                api.ExecuteCommand(self.reservation_id, dc.Name, '0', 'Delete_OSCustomizationSpec', [dc.FullAddress], False)
-            except Exception as exc:
-                self._internal_error(api, exc.args, exc.message)
+                api.ExecuteCommand(self.reservation_id, dc.Name, '0', 'Delete_OSCustomizationSpec', [], False)
+            except:
+                None
 
     def _run_async_power_on_refresh_ip_install(self, api, reservation_details, deploy_results, resource_details_cache):
         """
@@ -943,19 +954,9 @@ class EnvironmentSetup(object):
 
         if error_id.startswith(self.Stop_Deployment_code):
             api.WriteMessageToReservationOutput(reservationId=self.reservation_id, message='End Deployment')
-            self._clean_sandbox(api)
-            raise Exception(message, args)  # CCT Error EXE placed here
+            #api.EndReservation(reservationId=self.reservation_id, unmap=False)
+            raise Exception(message, args)
+            # CCT Error EXE placed here
 
         if error_id.startswith(self.Throw_Error_And_Continue_Code):
             None
-
-    def _clean_sandbox(self,api):
-
-        reservation_details = api.GetReservationDetails(self.reservation_id)
-
-        for resource in reservation_details.ReservationDescription.Resources:
-            res = api.ExecuteResourceConnectedCommand(self.reservation_id, resource.Name, 'destroy_vm','app_management', [], [], True)
-
-            self.logger.debug("Delete VM:{0}".format(resource.Name))
-            api.WriteMessageToReservationOutput(reservationId=self.reservation_id,
-                                                message=("Delete VM:{0}".format(resource.Name)))
